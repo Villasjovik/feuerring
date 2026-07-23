@@ -5,6 +5,8 @@ import * as THREE from 'three';
 import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
+const PRM = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 const hexInt = h => parseInt(h.replace('#',''),16);
 const darken = (h,f=.12) => { const c=hexInt(h); return (Math.max(0,((c>>16)&0xff)-Math.round(255*f))<<16)|(Math.max(0,((c>>8)&0xff)-Math.round(255*f))<<8)|Math.max(0,(c&0xff)-Math.round(255*f)); };
 
@@ -47,6 +49,13 @@ function initLogo3D(container) {
   const motion = container.dataset.motion || 'default'; // 'default' | 'float-spin'
   const material = container.dataset.material || 'default'; // gold, chrome, plastic, metal, glass
   const hasShadow = container.dataset.shadow !== 'false';
+
+  // Float envelope (world units) — MUST mirror the amplitudes in the motion
+  // equations in the render loop (float-spin: sin*38+sin*6 | default: sin*5+
+  // cos*2.5 | tilt: sin*6+sin*1.5). Used to place the shadow's ground line and
+  // to normalize the true per-frame mesh→ground distance.
+  const FLOAT_AMP = (!isTilt && motion === 'float-spin') ? 44 : 7.5;
+  const REST_Y = isTilt ? 0 : yOffset; // tilt-mode floats around 0 and ignores data-y-offset
 
   try { const c=document.createElement('canvas'); if(!c.getContext('webgl2')&&!c.getContext('webgl'))throw 0; }
   catch { if(fallback) container.innerHTML=`<img src="${fallback}" style="width:100%;height:100%;object-fit:contain;">`; return; }
@@ -149,22 +158,29 @@ function initLogo3D(container) {
 
   // GROUND SHADOW — vertical elliptical gradient facing camera
   // (horizontal plane would be edge-on to front camera = invisible)
+  // Genuinely coupled to the mesh: syncShadow() derives scale/opacity/sharpness/
+  // position every frame from the pivot's REAL world state — no parallel tween.
+  // uOpacity starts at 0 so no orphan blob renders before the SVG mesh exists.
   let shadowPlane = null;
+  let shadowSync = null; // { groundY, gapRest, gapMin, gapRange, baseScale } — set once the mesh is measured
+  let floatScale = 1; // trims float amplitude for tall logos so the mesh can never reach the shadow (ground line is SHARED and never moves)
   if (hasShadow) {
     const shadowGeo = new THREE.PlaneGeometry(400, 50);
     const shadowMat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
-      uniforms: { uOpacity: { value: 0.55 } },
+      uniforms: { uOpacity: { value: 0 }, uSharp: { value: 0.2 } },
       vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
       fragmentShader: `
         varying vec2 vUv;
         uniform float uOpacity;
+        uniform float uSharp;
         void main(){
-          // Elongated horizontal ellipse — like a real ground shadow viewed from front
+          // Elongated horizontal ellipse — like a real ground shadow viewed from front.
+          // uSharp = solid-core radius: 0.0 = all penumbra (soft), ~0.35 = crisp contact shadow.
           vec2 p = (vUv - 0.5) * 2.0;
           float d = length(vec2(p.x * 0.7, p.y * 2.5));
-          float a = smoothstep(1.0, 0.0, d);
+          float a = 1.0 - smoothstep(uSharp, 1.0, d);
           gl_FragColor = vec4(0.0, 0.0, 0.0, a * uOpacity);
         }`
     });
@@ -249,16 +265,44 @@ function initLogo3D(container) {
 
     pivot.add(logo);
 
-    // Position shadow plane
-    // If data-shadow-y is set, use absolute Y (aligns shadows across multiple logos)
-    // Otherwise auto: far below logo bottom so logo doesn't sit in its own shadow
+    // ── SHADOW BASELINE ─────────────────────────────────────────────────
+    // Every instance shares the same camera (fov 38, z 1050), so a given
+    // world-Y projects to the same RELATIVE height in every container no
+    // matter its pixel size. A fixed fraction of the visible frustum height
+    // is therefore ONE consistent visual baseline for all logos, regardless
+    // of each SVG's aspect/size (the old `-fSize.y/2 - 50` drifted with logo
+    // height — that's what put brand & VS shadows at different levels).
+    // The mesh bounding box then guarantees the ground clears the logo's
+    // lowest float point. data-shadow-y (absolute world Y) still overrides —
+    // fully backwards compatible with every existing pitch.
     if (shadowPlane) {
-      shadowPlane.position.y = shadowYAbs != null
-        ? parseFloat(shadowYAbs)
-        : -fSize.y / 2 - 50 + yOffset;
-      // scale width to match logo, keep height proportional
-      shadowPlane.scale.set(fSize.x / 380, 1, 1);
+      let groundY;
+      if (shadowYAbs != null) {
+        groundY = parseFloat(shadowYAbs);
+      } else {
+        groundY = -visH * 0.465 + REST_Y;              // shared baseline — lower for air under the arc (Lucas 2026-07-12)
+        groundY = Math.max(groundY, -visH / 2 + 26);   // keep the shadow inside the container
+      }
+      // The ground line is SHARED across instances and never moves per logo
+      // (shadow alignment is the whole point). Tall logos instead get their
+      // float AMPLITUDE trimmed so the mesh bottom can never enter the
+      // shadow's halo: clearance-at-rest minus a safe margin bounds the arc.
+      const SAFE = 30; // world units above the ground line the mesh must never enter
+      const clearanceRest = (REST_Y - fSize.y / 2) - groundY;
+      const ampEff = Math.max(6, Math.min(FLOAT_AMP, clearanceRest - SAFE));
+      floatScale = ampEff / FLOAT_AMP;
+      shadowSync = {
+        groundY,
+        gapRest: clearanceRest,
+        gapMin: clearanceRest - ampEff,
+        gapRange: ampEff * 2,
+        baseScale: fSize.x / 380, // plane is 400 wide — shadow width proportional to the logo
+      };
+      shadowPlane.position.y = groundY;
+      shadowPlane.scale.set(shadowSync.baseScale, 1, 1);
     }
+
+    wake(); // reduced-motion: paint the (single) static frame now that the mesh exists
   },
   undefined, // onProgress
   (err) => {
@@ -272,13 +316,10 @@ function initLogo3D(container) {
     }
   });
 
+  /* ── RENDER LOOP — pausable (tab/viewport) + reduced-motion-aware ── */
   const clock = new THREE.Clock();
 
-  (function loop() {
-    requestAnimationFrame(loop);
-    const dt = Math.min(clock.getDelta(), 0.05);
-    elapsed += dt;
-
+  function animatePivot() {
     if (pivot.children.length > 0) {
       const t = elapsed;
 
@@ -291,7 +332,7 @@ function initLogo3D(container) {
         pivot.rotation.x = Math.sin(t * 0.28 + phase * 1.3) * 0.055;
         pivot.rotation.z = Math.cos(t * 0.22 + phase * 0.7) * 0.02;
         // Float: noticeable up/down, gentle horizontal sway
-        pivot.position.y = Math.sin(t * 0.5 + phase) * 6 + Math.sin(t * 1.1 + phase) * 1.5;
+        pivot.position.y = (Math.sin(t * 0.5 + phase) * 6 + Math.sin(t * 1.1 + phase) * 1.5) * floatScale;
         pivot.position.x = Math.sin(t * 0.38 + phase * 0.8) * 3;
 
       } else if (rotateSpeed > 0) {
@@ -324,7 +365,7 @@ function initLogo3D(container) {
 
       if (!isTilt) {
         if (motion === 'float-spin') {
-          const floatY = Math.sin(t * 0.55) * 38 + Math.sin(t * 1.4) * 6;
+          const floatY = (Math.sin(t * 0.55) * 38 + Math.sin(t * 1.4) * 6) * floatScale;
           const floatX = Math.sin(t * 0.35) * 10 + Math.sin(t * 0.8) * 3;
           const depthExpansion = Math.abs(Math.sin(rotAngle)) * depth * 0.3;
           pivot.position.x = floatX + nudgeX + (nudgeX > 0 ? depthExpansion : -depthExpansion);
@@ -335,7 +376,7 @@ function initLogo3D(container) {
           pivot.rotation.z = Math.sin(t * 0.31) * 0.025;
         } else {
           const floatX = Math.sin(t * 0.41) * 4 + Math.sin(t * 1.17) * 1.5;
-          const floatY = Math.sin(t * 0.33) * 5 + Math.cos(t * 0.79) * 2.5;
+          const floatY = (Math.sin(t * 0.33) * 5 + Math.cos(t * 0.79) * 2.5) * floatScale;
           const depthExpansion = Math.abs(Math.sin(rotAngle)) * depth * 0.3;
           pivot.position.x = floatX + nudgeX + (nudgeX > 0 ? depthExpansion : -depthExpansion);
           pivot.position.y = floatY + yOffset;
@@ -344,27 +385,82 @@ function initLogo3D(container) {
         }
       }
     }
+  }
 
-    // Dynamic shadow: combines rotation shrink + float-based pulse
-    if (shadowPlane && logoBox) {
-      const c = Math.cos(rotAngle);
-      const rotScale = c * c; // 1 at front, 0 at sides, 1 at back
+  function poseStatic() {
+    // prefers-reduced-motion: static front-facing beauty shot at float rest.
+    if (!pivot.children.length) return;
+    pivot.position.set(nudgeX, REST_Y, 0);
+    // float-spin's constant forward X-tilt is kept so the key light reads the same
+    pivot.rotation.set((!isTilt && motion === 'float-spin') ? -0.12 : 0, 0, 0);
+  }
 
-      // Float-based pulse: high logo = small/light shadow, low logo = wide/dark
-      const floatY = pivot.position.y; // current Y from float animation
-      const floatNorm = (floatY + 50) / 100; // -50→0, 0→0.5, +50→1
-      const heightFactor = 1.3 - Math.max(0, Math.min(1, floatNorm)) * 0.6; // low=1.3, high=0.7
+  function syncShadow() {
+    if (!shadowPlane || !shadowSync || !logoBox) return;
+    // GENUINE mesh coupling: read the pivot's animated world state THIS frame
+    // and derive everything from the true mesh→ground distance. (Bottom edge =
+    // pivot Y − half-height: geometry is vertex-centered on the pivot, and the
+    // ≤0.14 rad ambient tilts change the projected bottom by <2% — a per-frame
+    // Box3.setFromObject would cost O(vertices) for no visible gain.)
+    const meshBottom = pivot.position.y - logoBox.h / 2;
+    const gap = Math.max(0, meshBottom - shadowSync.groundY);
+    const n = Math.min(1, Math.max(0, (gap - shadowSync.gapMin) / shadowSync.gapRange)); // 0 = bottom of float arc, 1 = top
 
-      const baseScale = logoBox.w / 380;
-      shadowPlane.position.x = pivot.position.x;
-      shadowPlane.scale.x = Math.max(0.05, baseScale * rotScale * heightFactor);
-      shadowPlane.scale.y = heightFactor; // also stretches/squashes vertically
-      shadowPlane.material.uniforms.uOpacity.value = 0.15 + rotScale * heightFactor * 0.5;
+    // True projected footprint of the extruded slab as it spins: w·|cosθ| + depth·|sinθ|
+    const footprint = Math.max(0.06,
+      Math.abs(Math.cos(pivot.rotation.y)) + (depth / logoBox.w) * Math.abs(Math.sin(pivot.rotation.y)));
+
+    // Contact-shadow model: logo rises → smaller/softer/lighter; sinks → larger/sharper/darker
+    shadowPlane.position.x = pivot.position.x - (gap - shadowSync.gapRest) * 0.12; // drifts away from the upper-right key light as the logo rises
+    shadowPlane.scale.x = Math.max(0.05, shadowSync.baseScale * footprint * (1.18 - 0.42 * n));
+    // scale.y är LÅST: symmetrisk y-skalning kring marklinjen fick bandets
+    // överkant att vandra ±5px när loggorna svävar i otakt → skuggorna såg
+    // olinjerade ut (Lucas 2026-07-12). Djup-känslan bärs av opacity+sharp+bredd.
+    shadowPlane.scale.y = 1.0;
+    shadowPlane.material.uniforms.uOpacity.value = (0.68 - 0.36 * n) * (0.3 + 0.7 * Math.min(1, footprint));
+    shadowPlane.material.uniforms.uSharp.value = 0.34 - 0.26 * n;
+  }
+
+  // Hidden-tab pausing is delegated to the browser: rAF is suspended for hidden
+  // tabs natively, so an rAF-driven loop already stops there. (Never gate on
+  // document.hidden — prerender/preview contexts report 'hidden' while still
+  // rendering, which would park the loop forever.) The explicit gate below is
+  // for the case rAF does NOT cover: container scrolled out of the viewport.
+  let rafId = 0;
+  let inView = true;
+
+  function loop() {
+    rafId = 0;
+    if (!inView) return; // parked off-screen — the IntersectionObserver wakes us
+    const dt = Math.min(clock.getDelta(), 0.05);
+    if (PRM) {
+      poseStatic();
+    } else {
+      elapsed += dt;
+      animatePivot();
     }
-
-    if (updSparks) updSparks(dt, logoBox);
+    syncShadow();
+    if (updSparks && !PRM) updSparks(dt, logoBox);
     renderer.render(scene, camera);
-  })();
+    if (!PRM) rafId = requestAnimationFrame(loop); // reduced-motion: exactly one frame per wake()
+  }
+
+  function wake() {
+    if (rafId || !inView) return;
+    clock.getDelta(); // flush the pause gap so motion resumes where it left off
+    rafId = requestAnimationFrame(loop);
+  }
+
+  // Return-to-visible: only flush the paused clock (rAF handled the pause itself)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { clock.getDelta(); wake(); }
+  });
+  new IntersectionObserver((entries) => {
+    inView = entries[entries.length - 1].isIntersecting;
+    if (inView) wake();
+  }, { rootMargin: '120px' }).observe(container);
+
+  wake();
 
   new ResizeObserver(() => {
     const w = container.clientWidth, h = container.clientHeight;
@@ -372,6 +468,7 @@ function initLogo3D(container) {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setSize(w, h);
+    wake(); // reduced-motion: repaint the static frame at the new size
   }).observe(container);
 }
 
